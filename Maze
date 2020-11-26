@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+from typing import List, Generator
+import os
+import json
+import re
+import logging
+from datetime import datetime, timedelta
+from collections import defaultdict
+from functools import lru_cache
+import boto3  # type: ignore
+
+logging.basicConfig()
+log = logging.getLogger(__file__)
+log.setLevel(logging.DEBUG)
+
+region_name = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+session = boto3.Session(region_name=region_name)
+
+DeltaTimeSeconds = 300
+
+
+class AmiNotFound(Exception):
+    pass
+
+
+class SourceImageService:
+    """
+    Service to determine the defintions for the account of what the
+    GoldImages that need to be built
+
+    The images definitions are stored in a ssm path, following the pattern:
+        {prefix}/{UniquePlatformShortName}/Name
+        {prefix}/{UniquePlatformShortName}/Source
+        {prefix}/{UniquePlatformShortName}/IgnoreBuild
+
+    IgnoreBuild existence determines if the SSM definition is used for build
+    or is just a placeholder to enable for the account. This is a good way
+    to push out definitions everywhere and add goldimage only if necessary.
+
+    """
+
+    def __init__(
+        self,
+        ssm_path,
+        build_document,
+        session=boto3.Session(),
+    ):
+        self.ssm_path = ssm_path
+        self.build_document = build_document
+        self.session = session
+
+    @property
+    def aws_owners(self):
+        return [
+            "309956199498",
+            "amazon",
+            "aws-marketplace",
+        ]
+
+    @lru_cache()
+    def image_details(self, source: str) -> dict:
+        m = re.match(r"^([^:]+):(.*)", source)
+
+        if not m:
+            raise Exception(f"Image source of {source} is invalid")
+
+        fn = getattr(self, m.group(1) + "_image_details", None)
+        if fn and callable(fn):
+            details = fn(m.group(2))
+            return details
+        else:
+            raise Exception(f"Unable to process {source}")
+
+    def ami_image_details(self, source: str) -> dict:
+        "Get the ImageIds from wildcard name"
+        log.debug("Looking up ami_id from ec2 filter: %s", source)
+        images = self._describe_images(Name=source)
+
+        if images:
+            return {
+                "SourceAMI": images[0]["ImageId"],
+                "ImageDetails": images[0]
+            }
+        else:
+            return {}
+
+    def direct_image_details(self, image_id: str) -> dict:
+        "Get the ImageIds from wildcard name"
+        images = self._describe_images(ImageId=image_id)
+
+        if images:
+            return {
+                "SourceAMI": images[0]["ImageId"],
+                "ImageDetails": images[0]
+            }
+        else:
+            return {}
+
+    def eb_image_arns(self, source: str) -> Generator[str, None, None]:
+        eb = self.session.client("elasticbeanstalk")
+        params = {
+            "Filters": [
+                {
+                    "Type": "PlatformName",
+                    "Operator": "=",
+                    "Values": [source]
+                },
+                {
+                    "Type": "PlatformStatus",
+                    "Operator": "=",
+                    "Values": ["Ready"]
+                },
+            ]
+        }
+
+        while True:
+            response = eb.list_platform_versions(**params)
+            for platform in response["PlatformSummaryList"]:
+                yield platform["PlatformArn"]
+
+            if "NextToken" in response:
+                params["NextToken"] = response["NextToken"]
+            else:
+                break
+
+    def eb_image_details(self, source: str) -> dict:
+        "Get the EB image ids"
+        eb = self.session.client("elasticbeanstalk")
+        details = []
+        for arn in self.eb_image_arns(source):
+            params = {"PlatformArn": arn}
+            response = eb.describe_platform_version(**params)
+            platform = response["PlatformDescription"]
+            image_ids = [
+                i["ImageId"]
+                for i in platform["CustomAmiList"]
+                if i.get("VirtualizationType") == "hvm"
+            ]
+            if image_ids:
+                images = self._describe_images(ImageId=image_ids[0])
+                details.append(
+                    {
+                        "SourceAMI": images[0]["ImageId"],
+                        "PlatformName": platform["PlatformName"],
+                        "PlatformVersion": platform["PlatformVersion"],
+                        "EBSolutionStackName": platform["SolutionStackName"],
+                        "DateCreated": platform["DateCreated"],
+                        "DateUpdated": platform["DateUpdated"],
+                        "ImageDetails": images[0],
+                    }
+                )
+
+        details.sort(key=lambda i: i["DateCreated"], reverse=True)
+        return details[0] if details else {}
+
+    def ssm_image_details(self, source: str) -> dict:
+        "Get ImageId from SSM parameter, such as AWS published SSM param"
+        log.debug("Looking up ami_id from ssm source: %s", source)
+        ssm = self.session.client("ssm")
+        response = ssm.get_parameter(Name=source)
+        image_id: str = response["Parameter"]["Value"]
+        log.debug("Found image_id for %s: %s", source, image_id)
+
+        images = self._describe_images(ImageId=image_id)
+
+        if images:
+            return {"SourceAMI": image_id, "ImageDetails": images[0]}
+        else:
+            return {}
+
+    def _describe_images(self, **kwargs) -> List[dict]:
+        """
+        Description of latest images reverse sorted by creation date
+            Name
+            ImageId
+        """
+
+        ec2 = self.session.client("ec2")
+        params = {
+            "Filters": [
+                {"Name": "architecture", "Values": ["x86_64"]},
+                {"Name": "image-type", "Values": ["machine"]},
+                {"Name": "root-device-type", "Values": ["ebs"]},
+                {"Name": "virtualization-type", "Values": ["hvm"]},
+                {"Name": "state", "Values": ["available"]},
+            ],
+            "Owners": self.aws_owners,
+        }
+
+        if "Name" in kwargs:
+            params["Filters"].append({
+                "Name": "name",
+                "Values": [kwargs["Name"]]
+            })
+
+        if "ImageId" in kwargs:
+            params["ImageIds"] = [kwargs["ImageId"]]
+
+        response = ec2.describe_images(**params)
+        images = response.get("Images", [])
+        log.debug("Found images : %s", images)
+        for image in images:
+            image["CreationDate"] = datetime.fromisoformat(
+                image["CreationDate"][:-1]
+            )
+
+        images.sort(key=lambda i: i["CreationDate"], reverse=True)
+        log.debug("Found images after sort: %s", images)
+
+        return images
+
+    def ssm_goldimage_definitions(self) -> List[dict]:
+        """
+        Find the desired built images parameters for the account
+        by using the details from the ssm_path using the form:
+            REQUIRED
+            --------
+            ssm_path/PlatformShortName/Platform
+            ssm_path/PlatformShortName/Source
+
+            OPTIONAL
+            --------
+            ssm_path/PlatformShortName/BlockDevices
+            ssm_path/PlatformShortName/UserData
+
+
+
+        where:
+            Source is a string to determine what is the source AMI
+            BlockDevices is the parameters to pass to the SSM automation
+
+
+        """
+        log.info("Finding all account platforms from SSM path %s",
+                 self.ssm_path)
+        ssm = session.client("ssm")
+        params = {"Path": self.ssm_path, "Recursive": True}
+        definitions: dict = defaultdict(dict)
+        parameter_re = re.compile(
+            r"""
+                ^(?P<path>.*
+                /(?P<name>[^/]+))
+                /(?P<key>[^/]+)$
+            """,
+            flags=re.VERBOSE,
+        )
+        while True:
+            response = ssm.get_parameters_by_path(**params)
+            for parameter in response.get("Parameters", []):
+                m = parameter_re.search(parameter["Name"])
+                if m:
+                    name = m.group("name")
+                    definitions[name]["Path"] = m.group("path")
+                    definitions[name][m.group("key")] = parameter["Value"]
+
+            if "NextToken" in response:
+                params["NextToken"] = response["NextToken"]
+            else:
+                break
+
+        build_definitions = []
+        required_keys = {"Platform", "Source"}
+        for platform_short_name, definition in definitions.items():
+            if required_keys <= set(definition.keys()):
+                definition["DocumentName"] = self.build_document
+
+                if "Parameters" in definition:
+                    definition["Parameters"] = \
+                        json.loads(definition["Parameters"])
+
+                build_definitions.append(definition)
+
+        log.debug(
+            "Source Images for Account: %s",
+            json.dumps(build_definitions, default=str)
+        )
+        self.resolve_sources(build_definitions)
+        return build_definitions
+
+    def resolve_sources(self, definitions: List[dict]) -> List[dict]:
+        log.debug("Resolving sources for definitions: %s", definitions)
+
+        for definition in definitions:
+            log.info("Looking up image details for %s", definition["Source"])
+            details = self.image_details(definition["Source"])
+            log.debug("details: %s", json.dumps(details, default=str))
+            if "BlockDevices" in definition:
+                block_devices = definition["BlockDevices"]
+                root_device = details.get("ImageDetails", {}) \
+                    .get("RootDeviceName")
+                if not root_device:
+                    log.error("Couldn't find RootDeviceName from: %s",
+                              json.dumps(details, default=str))
+
+                    raise Exception
+                block_devices = block_devices.replace("{RootDeviceName}",
+                                                      root_device)
+                definition["BlockDevices"] = [
+                    json.dumps(i) for i in json.loads(block_devices)
+                ]
+            else:
+                image_details = details["ImageDetails"]
+                block_devices = image_details["BlockDeviceMappings"]
+                for block_device in block_devices:
+                    if "Ebs" in block_device:
+                        block_device["Ebs"]["Encrypted"] = True
+                definition["BlockDevices"] = [
+                    json.dumps(i) for i in block_devices
+                ]
+
+            definition.update(details)
+
+        return definitions
+
+
+def filter_existing_gi(gi_definitions, tag_prefix="gi02-"):
+    ec2 = session.client("ec2")
+    amis = [e["SourceAMI"] for e in gi_definitions]
+    goldimage_source = defaultdict(set)
+    response = ec2.describe_images(
+        Filters=[
+            {
+                "Name": "tag:SourceAMI",
+                "Values": amis
+            },
+            {
+                "Name": "tag:Name",
+                "Values": [tag_prefix + "*"]
+            },
+            {
+                "Name": "tag:Version",
+                "Values": ["v3"]
+            },
+            {
+                "Name": "tag:GoldImage",
+                "Values": ["true"]
+            }
+        ]
+    )
+    for image in response.get("Images"):
+        tags = {e["Key"]: e["Value"] for e in image["Tags"]}
+        if "Platform" in tags:
+            goldimage_source[tags["SourceAMI"]].add(tags["Platform"])
+
+    for definition in gi_definitions:
+        sourceami = definition.get("SourceAMI")
+        platform = definition.get("Platform")
+
+        if sourceami not in goldimage_source:
+            yield definition
+        elif platform not in goldimage_source[sourceami]:
+            yield definition
+
+
+def source_tag_cleaner(source):
+    return source.replace("*", "_")
+
+
+def build_request(goldimage, delay=0):
+    ssm = session.client("ssm")
+    document_name = goldimage.get("DocumentName")
+    source_ami = goldimage.get("SourceAMI")
+    platform = goldimage.get("Platform")
+    parameters = goldimage.get("Parameters", {})
+    block_devices = goldimage.get("BlockDevices")
+    user_data = goldimage.get("UserData")
+    path = goldimage.get("Path")
+
+    if path:
+        platform_key = path.split("/")[-1]
+    else:
+        platform_key = platform
+
+    if document_name and source_ami:
+        log.info(
+            "Processing %s/%s/%s delay = %s",
+            document_name,
+            platform,
+            source_ami,
+            delay
+        )
+        params = {
+            "DocumentName": document_name,
+            "Parameters": {
+                "imageId": [source_ami],
+                "imageName": [platform],
+                "platform": [platform],
+                "platformKey": [platform_key],
+                "delayTime": [f"PT{delay}S"],
+                "blockDevices": block_devices,
+            },
+        }
+        if user_data:
+            params["Parameters"]["userData"] = [user_data]
+
+        tags = {
+            "Platform": platform,
+            "SourceAMI": source_ami,
+            "Source": source_tag_cleaner(goldimage["Source"]),
+        }
+
+        description = goldimage.get("Description")
+        if description:
+            params["Parameters"]["imageDescription"] = [description]
+        else:
+            params["Parameters"]["imageDescription"] = [platform]
+
+        solution_stack = goldimage.get("EBSolutionStackName")
+        if solution_stack:
+            params["Parameters"]["solutionStack"] = [solution_stack]
+            tags["EBSolutionStackName"] = solution_stack
+
+        if path:
+            params["Parameters"]["goldImageParameter"] = [path + "/ImageId"]
+
+        for k in parameters:
+            if isinstance(parameters[k], str):
+                parameters[k] = [parameters[k]]
+            else:
+                parameters[k] = [json.dumps(parameters[k])]
+        params["Parameters"].update(parameters)
+
+        params["Tags"] = [{"Key": k, "Value": v} for k, v in tags.items()]
+
+        log.debug("Sending message to sms automation: %s",
+                  json.dumps(params, indent=4))
+
+        response = ssm.start_automation_execution(**params)
+        log.debug("Response for ssm: %s", json.dumps(response, default=str))
+
+
+def ready_to_run_automation(document, tag_prefix, platform):
+    """
+    Resume any waiting automations for the platform
+
+    Cleanup environment. Only ready to run if no Pending/Running
+    """
+    ssm = session.client('ssm')
+
+    strip_id_doc = "-".join(document.split("-")[:-1])
+    params = {
+        "Filters": [
+            {
+                "Key": "DocumentNamePrefix",
+                "Values": [document, strip_id_doc]
+            },
+            {
+                "Key": "ExecutionStatus",
+                "Values": [
+                    "Pending",
+                    "InProgress",
+                    "Waiting"
+                ]
+            }
+        ]
+    }
+
+    while True:
+        response = ssm.describe_automation_executions(**params)
+        for exec_meta in response.get("AutomationExecutionMetadataList"):
+            exec_response = ssm.get_automation_execution(
+                AutomationExecutionId=exec_meta["AutomationExecutionId"]
+            )
+            execution = exec_response["AutomationExecution"]
+            parameters = execution.get("Parameters")
+            exec_platform = parameters.get("platform")
+            log.debug("exec platform vs platform = %s, %s",
+                      exec_platform, platform)
+            if platform in exec_platform:
+
+                if execution["AutomationExecutionStatus"] == "Waiting":
+                    execution_id = execution["AutomationExecutionId"]
+                    log.info(
+                        "Resuming paused Automation: %s",
+                        execution_id
+                    )
+                    ssm.send_automation_signal(
+                        AutomationExecutionId=execution_id,
+                        SignalType="Resume",
+                        Payload={
+                            "StepName": [execution["CurrentStepName"]]
+                        }
+                    )
+                else:
+                    log.debug(
+                        "Found Automation still running for %s: %s",
+                        platform,
+                        json.dumps(parameters, default=str, indent=4)
+                    )
+
+                    return False
+
+        if "NextToken" in response:
+            params["NextToken"] = response["NextToken"]
+        else:
+            break
+
+    ec2 = session.client("ec2")
+    params = {
+        "Filters": [
+            {
+                "Name": "instance-state-name",
+                "Values": ["pending", "running", "stopping", "stopped"]
+            },
+            {
+                "Name": "tag:Name",
+                "Values": [tag_prefix + platform]
+            },
+            {
+                "Name": "tag-key",
+                "Values": ["ExecutionId"]
+            }
+        ]
+    }
+    instance_ids = []
+    while True:
+        response = ec2.describe_instances(**params)
+
+        for reservation in response.get("Reservations"):
+            for instance in reservation.get("Instances"):
+                instance_ids.append(instance["InstanceId"])
+
+        if "NextToken" in response:
+            params["NextToken"] = response["NextToken"]
+        else:
+            break
+
+    if instance_ids:
+        _ = ec2.terminate_instances(InstanceIds=instance_ids)
+    return True
+
+
+def handler(event, context):
+    """
+    Determine the gold images that need to be built.
+    """
+    platform_path = os.environ["PlatformPath"]
+    minimum_age = int(os.getenv("MinimumAgeInDays", 3))
+    tag_prefix = os.environ["TagNamePrefix"]
+    build_document = os.environ["BuildGoldImageDocument"]
+    platforms = event.get("Platforms")
+    force_update = event.get("ForceUpdate", False)
+
+    sis = SourceImageService(
+        ssm_path=platform_path,
+        build_document=build_document,
+    )
+    gi_definitions = sis.ssm_goldimage_definitions()
+
+    req_fields = {"Source", "Platform", "DocumentName"}
+    gi_definitions = [
+        gi for gi in gi_definitions if req_fields <= set(gi.keys())
+    ]
+
+    if not force_update:
+        gi_definitions = list(
+            filter_existing_gi(gi_definitions, tag_prefix=tag_prefix)
+        )
+        cutoff_date = datetime.today() - timedelta(days=minimum_age)
+        gi_definitions = [
+            i for i in gi_definitions
+            if i["ImageDetails"]["CreationDate"] < cutoff_date
+        ]
+
+    if platforms:
+        gi_definitions = [
+            d for d in gi_definitions if d["Platform"] in platforms
+        ]
+
+    if gi_definitions:
+        for idx, gi in enumerate(gi_definitions):
+            if ready_to_run_automation(build_document, tag_prefix,
+                                       gi["Platform"]):
+                log.info("building gold image for %s", gi["Platform"])
+                build_request(gi, delay=idx * DeltaTimeSeconds)
+            else:
+                log.warning("found running/pending automation for %s",
+                            gi["Platform"])
+    else:
+        log.info("no gold images needed to be built")
+
+    return json.loads(
+        json.dumps(gi_definitions, default=str)
+    )
+
+
+def setup_environment():
+    os.environ["PlatformPath"] = "/asap/gifactory/Platforms"
+    os.environ["MinimumAgeInDays"] = "3"
+    os.environ["TagNamePrefix"] = "gi02-"
+
+    ssm = session.client('ssm')
+
+    tag_name = "BuildGoldImage"
+    params = {
+        "Filters": [
+            {
+                "Key": "tag:Name",
+                "Values": [tag_name]
+            }
+        ]
+    }
+    while True:
+        response = ssm.list_documents(**params)
+        for doc in response.get("DocumentIdentifiers"):
+            tags = {tag["Key"]: tag["Value"] for tag in doc["Tags"]}
+            if tags["Name"] == tag_name:
+                os.environ[tags["Name"] + "Document"] = doc["Name"]
+
+        if "NextToken" in response:
+            params["NextToken"] = response["NextToken"]
+        else:
+            break
+
+
+if __name__ == "__main__":
+    import unittest.mock as mock
+    context = mock.MagicMock()
+    context.log_group_name = "LogGroup"
+    context.log_stream_name = "LogStream"
+    context.aws_request_id = 12345
+    context.invoked_function_arn = "arn:aws:region:123456789:lambda"
+    event = {
+        "Platforms": [
+            # "Windows2019"
+            # "CentOS7"
+            # "Eks"
+            # "Tomcat 8.5 with Corretto 11 running on 64bit Amazon Linux 2"
+            # "BigData",
+            "TrendDSM"
+        ],
+        "ForceUpdate": True
+    }
+    # event = {}
+    setup_environment()
+    handler(event, context)
